@@ -583,11 +583,34 @@ def extract_minimal_text(body):
     return " | ".join(relevant[:8])
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ════════════════════════════════════════════
+# ✅ GROQ AI — SECOND PASS VERIFICATION
+# Model  : qwen/qwen3-32b (free tier)
+# Format : 1:true / 2:false  (batch, 1 API call)
+# Output : minimal tokens — just number:bool per post
+# ════════════════════════════════════════════
 def groq_verify_batch(posts):
     """
-    Send batch of posts to Groq for verification.
-    Each post → send only minimal extracted text.
-    Returns list of posts that passed AI verification.
+    Send ALL posts in ONE Groq API call.
+    AI returns only:  1:true / 2:false
+    true  = KEEP  (fresher, India or no location, genuine job)
+    false = REMOVE (exp > 1yr, foreign, not a real job)
     """
     if not GROQ_API_KEY or not posts:
         return posts, []
@@ -596,75 +619,102 @@ def groq_verify_batch(posts):
         from groq import Groq
         client = Groq(api_key=GROQ_API_KEY)
 
+        # ── Build numbered batch ──
+        # Each post → 1 line of minimal extracted signals only
+        batch_lines = []
+        for i, item in enumerate(posts, start=1):
+            mini = extract_minimal_text(item["body"])
+            batch_lines.append(f"{i}. {mini}")
+
+        batch_text = "\n".join(batch_lines)
+
+        # ── Prompt ──
+        # /nothink disables qwen3-32b chain-of-thought → saves tokens + latency
+        prompt = (
+            "/nothink\n\n"
+            "You are a strict job post filter for INDIA-based FRESHERS only.\n\n"
+            "For each numbered post below, output EXACTLY:\n"
+            "  number:true   → KEEP\n"
+            "  number:false  → REMOVE\n\n"
+            "KEEP rules:\n"
+            "- Fresher / 0–1 year / entry-level / intern / trainee\n"
+            "- Location is India OR location not mentioned at all\n"
+            "- Looks like a genuine job opening\n\n"
+            "REMOVE rules:\n"
+            "- Requires more than 1 year of experience\n"
+            "- Job is outside India (USA, UK, Canada, UAE, etc.)\n"
+            "- Not a real job post (advertisement, motivational, spam)\n\n"
+            "⚠️ Output ONLY lines like:\n"
+            "1:true\n"
+            "2:false\n"
+            "3:true\n"
+            "No explanation. No extra text. No blank lines.\n\n"
+            f"Posts:\n{batch_text}"
+        )
+
+        # ── API call ──
+        # max_tokens: ~6 tokens per post (e.g. "12:false\n") + small buffer
+        max_out = max(len(posts) * 8, 60)
+
+        response = client.chat.completions.create(
+            model="qwen/qwen3-32b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,          # fully deterministic
+            max_tokens=max_out,
+        )
+
+        raw_output = response.choices[0].message.content.strip()
+        print(f"[Groq qwen3-32b] raw output:\n{raw_output}")
+
+        # ── Parse response ──
+        # Only accept lines that strictly match   digit(s):true/false
+        # Ignores any stray <think>…</think> or explanation lines
+        DECISION_RE = re.compile(r"^(\d+)\s*:\s*(true|false)$", re.IGNORECASE)
+        decisions   = {}
+
+        for line in raw_output.splitlines():
+            line = line.strip()
+            m    = DECISION_RE.match(line)
+            if m:
+                idx      = int(m.group(1))
+                decision = m.group(2).lower()   # "true" or "false"
+                decisions[idx] = decision
+
+        # ── Apply decisions ──
         passed  = []
         removed = []
 
-        # Build batch prompt — all posts in ONE API call
-        # to minimize API requests and latency
-        batch_items = []
-        for i, item in enumerate(posts):
-            mini_text = extract_minimal_text(item["body"])
-            batch_items.append(f"[{i}] {mini_text}")
-
-        batch_text = "\n".join(batch_items)
-
-        prompt = f"""You are a job post filter for India-based FRESHERS only.
-
-Analyze each job post below. For each post, reply with ONLY the index number and decision.
-
-REMOVE if:
-- Requires more than 1 year experience
-- Job location is outside India
-- Post is not a genuine job opening
-
-KEEP if:
-- For freshers / 0-1 year / entry level
-- Location is India or not mentioned
-- Genuine job post
-
-Reply format (one line per post, nothing else):
-0:KEEP
-1:REMOVE
-2:KEEP
-
-Posts:
-{batch_text}"""
-
-        response = client.chat.completions.create(
-            model="llama3-8b-8192",   # fast + free
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,            # deterministic
-            max_tokens=200,           # minimal output tokens
-        )
-
-        result_text = response.choices[0].message.content.strip()
-
-        # Parse AI response
-        decisions = {}
-        for line in result_text.splitlines():
-            line = line.strip()
-            if ":" in line:
-                parts = line.split(":")
-                try:
-                    idx      = int(parts[0].strip())
-                    decision = parts[1].strip().upper()
-                    decisions[idx] = decision
-                except:
-                    pass
-
-        # Apply decisions
-        for i, item in enumerate(posts):
-            decision = decisions.get(i, "KEEP")  # default KEEP if AI unclear
-            if decision == "KEEP":
+        for i, item in enumerate(posts, start=1):
+            # Default → "true" (KEEP) if AI skipped or was unclear
+            decision = decisions.get(i, "true")
+            if decision == "true":
                 passed.append(item)
             else:
-                removed.append(item)
+                removed.append({
+                    **item,
+                    "removed_reason": "AI filter",
+                })
 
+        print(
+            f"[Groq] Total={len(posts)} | "
+            f"Kept={len(passed)} | Removed={len(removed)} | "
+            f"Parsed={len(decisions)}"
+        )
         return passed, removed
 
     except Exception as e:
-        print(f"Groq Error: {e}")
-        return posts, []   # fallback: keep all if Groq fails
+        print(f"[Groq Error] {e}")
+        return posts, []    # ← safe fallback: keep all posts if Groq fails
+
+
+
+
+
+
+
+
+
+
 
 
 # ════════════════════════════════════════════
